@@ -2,23 +2,15 @@
 
 #include "Platform.h"
 #include "Limelight.h"
-#include "PlatformSockets.h"
 #include "PlatformThreads.h"
-#include "PlatformCrypto.h"
 #include "Video.h"
-#include "Input.h"
 
 // Common globals
-extern char* RemoteAddrString;
-extern struct sockaddr_storage RemoteAddr;
-extern struct sockaddr_storage LocalAddr;
-extern SOCKADDR_LEN AddrLen;
 extern STREAM_CONFIGURATION StreamConfig;
 extern CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 extern DECODER_RENDERER_CALLBACKS VideoCallbacks;
 extern AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 extern int NegotiatedVideoFormat;
-extern volatile bool ConnectionInterrupted;
 extern bool HighQualitySurroundSupported;
 extern bool HighQualitySurroundEnabled;
 extern OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
@@ -44,8 +36,6 @@ extern uint32_t SunshineFeatureFlags;
 #define ML_FF_IDENTITY_GBR_444 0x04 // Client requests full-range identity G,B,R plane mapping
 #define ML_FF_LOCAL_CURSOR PLANK_CURSOR_CLIENT_FEATURE_FLAG // Client presents host cursor shapes through its local compositor cursor
 
-#define UDP_RECV_POLL_TIMEOUT_MS 100
-
 // At this value or above, we will request high quality audio unless CAPABILITY_SLOW_OPUS_DECODER
 // is set on the audio renderer.
 #define HIGH_AUDIO_BITRATE_THRESHOLD 15000
@@ -64,7 +54,6 @@ void* extendBuffer(void* ptr, size_t newSize);
 
 void fixupMissingCallbacks(PDECODER_RENDERER_CALLBACKS* drCallbacks, PAUDIO_RENDERER_CALLBACKS* arCallbacks,
     PCONNECTION_LISTENER_CALLBACKS* clCallbacks);
-void setRecorderCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks);
 
 int initializeControlStream(void);
 int startControlStream(void);
