@@ -1,25 +1,19 @@
 #include "Limelight-internal.h"
+#include <stdatomic.h>
 
 static int stage = STAGE_NONE;
 static ConnListenerConnectionTerminated originalTerminationCallback;
-static bool alreadyTerminated;
-static PLT_THREAD terminationCallbackThread;
-static int terminationCallbackErrorCode;
+static atomic_bool alreadyTerminated = true;
 static bool NativeSessionConfigurationPending;
 static PLANK_NATIVE_SESSION_CONFIGURATION NativeSessionConfiguration;
 static uint32_t ActiveServiceFlags;
 
 // Common globals
-char* RemoteAddrString;
-struct sockaddr_storage RemoteAddr;
-struct sockaddr_storage LocalAddr;
-SOCKADDR_LEN AddrLen;
 STREAM_CONFIGURATION StreamConfig;
 CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 DECODER_RENDERER_CALLBACKS VideoCallbacks;
 AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 int NegotiatedVideoFormat;
-volatile bool ConnectionInterrupted;
 bool HighQualitySurroundSupported;
 bool HighQualitySurroundEnabled;
 OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
@@ -32,7 +26,6 @@ uint32_t SunshineFeatureFlags;
 static const char* stageNames[STAGE_MAX] = {
     "none",
     "platform initialization",
-    "name resolution",
     "audio stream initialization",
     "session negotiation",
     "control stream initialization",
@@ -109,7 +102,7 @@ int LiSetPlankNativeSessionConfiguration(
 // so it is not safe to start another connection before LiStartConnection() returns.
 void LiInterruptConnection(void) {
     // Signal anyone waiting on the global interrupted flag
-    ConnectionInterrupted = true;
+    atomic_store(&alreadyTerminated, true);
 }
 
 uint32_t LiGetPlankNativeServiceFlags(void) {
@@ -176,10 +169,6 @@ void LiStopConnection(void) {
         stage--;
         Limelog("done\n");
     }
-    if (stage == STAGE_NAME_RESOLUTION) {
-        // Nothing to do
-        stage--;
-    }
     if (stage == STAGE_PLATFORM_INIT) {
         Limelog("Cleaning up platform...");
         cleanupPlatform();
@@ -189,46 +178,18 @@ void LiStopConnection(void) {
     LC_ASSERT(stage == STAGE_NONE);
     ActiveServiceFlags = 0;
     
-    if (RemoteAddrString != NULL) {
-        free(RemoteAddrString);
-        RemoteAddrString = NULL;
-    }
+
 }
 
-static void terminationCallbackThreadFunc(void* context)
-{
-    // Invoke the client's termination callback
-    originalTerminationCallback(terminationCallbackErrorCode);
-}
-
-// This shim callback runs the client's connectionTerminated() callback on a
-// separate thread. This is neccessary because other internal threads directly
-// invoke this callback. That can result in a deadlock if the client
-// calls LiStopConnection() in the callback when the cleanup code
-// attempts to join the thread that the termination callback (and LiStopConnection)
-// is running on.
+// Notify on the producer thread. Owners enqueue recovery/teardown on their
+// session worker; they must not join media workers from this callback. All
+// producers are joined by LiStopConnection(), so callbacks cannot outlive the
+// session or leak into a replacement connection. No detached callback thread.
 static void ClInternalConnectionTerminated(int errorCode)
 {
-    int err;
-
-    // Avoid recursion and issuing multiple callbacks
-    if (alreadyTerminated || ConnectionInterrupted) {
-        return;
+    if (!atomic_exchange(&alreadyTerminated, true)) {
+        originalTerminationCallback(errorCode);
     }
-
-    terminationCallbackErrorCode = errorCode;
-    alreadyTerminated = true;
-
-    // Invoke the termination callback on a separate thread
-    err = PltCreateThread("AsyncTerm", terminationCallbackThreadFunc, NULL, &terminationCallbackThread);
-    if (err != 0) {
-        // Nothing we can safely do here, so we'll just assert on debug builds
-        Limelog("Failed to create termination thread: %d\n", err);
-        LC_ASSERT(err == 0);
-    }
-
-    // Detach the thread since we never wait on it
-    PltDetachThread(&terminationCallbackThread);
 }
 
 // Starts the connection to the streaming machine
@@ -236,13 +197,11 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     PDECODER_RENDERER_CALLBACKS drCallbacks, PAUDIO_RENDERER_CALLBACKS arCallbacks, void* renderContext, int drFlags,
     void* audioContext, int arFlags) {
     int err;
-    uint16_t sessionPortNumber;
 
     if (!NativeSessionConfigurationPending) {
         Limelog("PLANK native session configuration is required\n");
         return -1;
     }
-    sessionPortNumber = (uint16_t) NativeSessionConfiguration.sessionPort;
     ActiveServiceFlags = NativeSessionConfiguration.serviceFlags;
 
     if (drCallbacks != NULL && (drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && drCallbacks->submitDecodeUnit) {
@@ -273,10 +232,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     memcpy(&VideoCallbacks, drCallbacks, sizeof(VideoCallbacks));
     memcpy(&AudioCallbacks, arCallbacks, sizeof(AudioCallbacks));
 
-#ifdef LC_DEBUG_RECORD_MODE
-    // Install the pass-through recorder callbacks
-    setRecorderCallbacks(&VideoCallbacks, &AudioCallbacks);
-#endif
+
 
     // Hook the termination callback so we can avoid issuing a termination callback
     // after LiStopConnection() is called.
@@ -286,18 +242,15 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     memcpy(&ListenerCallbacks, clCallbacks, sizeof(ListenerCallbacks));
     ListenerCallbacks.connectionTerminated = ClInternalConnectionTerminated;
 
-    memset(&LocalAddr, 0, sizeof(LocalAddr));
     NegotiatedVideoFormat = (int)NativeSessionConfiguration.negotiatedVideoFormat;
     SunshineFeatureFlags = NativeSessionConfiguration.hostFeatureFlags;
     ReferenceFrameInvalidationSupported =
         NativeSessionConfiguration.referenceFrameInvalidationSupported != 0;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
-    RemoteAddrString = strdup(serverInfo->address);
 
     Limelog("Native QUIC session negotiation is complete\n");
 
     alreadyTerminated = false;
-    ConnectionInterrupted = false;
     
     // Validate the audio configuration
     if ((ActiveServiceFlags & PLANK_NATIVE_SERVICE_AUDIO) &&
@@ -335,39 +288,8 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     ListenerCallbacks.stageComplete(STAGE_PLATFORM_INIT);
     Limelog("done\n");
 
-    Limelog("Resolving host name...");
-    ListenerCallbacks.stageStarting(STAGE_NAME_RESOLUTION);
-    err = resolveHostName(serverInfo->address, AF_UNSPEC, sessionPortNumber,
-                          &RemoteAddr, &AddrLen);
-    if (err != 0) {
-        PltSleepMs(1000);
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, sessionPortNumber,
-                              &RemoteAddr, &AddrLen);
-    }
-    if (err != 0) {
-        Limelog("failed: %d\n", err);
-        ListenerCallbacks.stageFailed(STAGE_NAME_RESOLUTION, err);
-        goto Cleanup;
-    }
-
-    // Resolve LocalAddr by RemoteAddr.
-    {
-        SOCKADDR_LEN localAddrLen;
-        err = getLocalAddressByUdpConnect(&RemoteAddr, AddrLen, sessionPortNumber,
-                                          &LocalAddr, &localAddrLen);
-        if (err != 0) {
-            Limelog("failed to resolve local addr: %d\n", err);
-            ListenerCallbacks.stageFailed(STAGE_NAME_RESOLUTION, err);
-            goto Cleanup;
-        }
-        LC_ASSERT(localAddrLen == AddrLen);
-    }
-
-    stage++;
-    LC_ASSERT(stage == STAGE_NAME_RESOLUTION);
-    ListenerCallbacks.stageComplete(STAGE_NAME_RESOLUTION);
-    Limelog("done\n");
-
+    // The owner has already authenticated and connected the native transport.
+    // Media setup must not perform a second DNS/socket reachability check.
     Limelog("Initializing audio stream...");
     ListenerCallbacks.stageStarting(STAGE_AUDIO_STREAM_INIT);
     err = (ActiveServiceFlags & PLANK_NATIVE_SERVICE_AUDIO) ? initializeAudioStream() : 0;
@@ -475,14 +397,6 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     ListenerCallbacks.stageComplete(STAGE_INPUT_STREAM_START);
     Limelog("done\n");
     
-    // Wiggle the mouse a bit to wake the display up
-    if (ActiveServiceFlags & PLANK_NATIVE_SERVICE_INPUT) {
-        LiSendMouseMoveEvent(1, 1);
-        PltSleepMs(10);
-        LiSendMouseMoveEvent(-1, -1);
-        PltSleepMs(10);
-    }
-
     ListenerCallbacks.connectionStarted();
 
 Cleanup:
